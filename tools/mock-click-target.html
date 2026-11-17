@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>fans-utils mock click target</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; }
+  /* The screen observer watches a large region of the window, not just the button, so in
+     change=0 mode NOTHING anywhere on the page may repaint on a click: no counter, no log,
+     no :active flash. Anything that must be recorded is buffered and shown only on demand. */
+  #hit { width: 420px; height: 240px; font-size: 40px; font-weight: 700; border-radius: 16px;
+         border: 4px solid #555; background: #ffd54f; color: #222; cursor: crosshair; display: block; }
+  #hit.accepted { background: #2e7d32; color: #fff; border-color: #1b5e20; }
+  /* The pressed-state flash exists only when a visible change is wanted; change=0 removes the
+     class entirely so a mousedown/mouseup pair cannot leave a transient frame. */
+  #hit.plain:active { background: #ff8f00; }
+  #count { font-size: 56px; margin: 16px 0 4px; }
+  ol { font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+  p, #mode { max-width: 640px; }
+  #mode { font-family: ui-monospace, Menlo, monospace; font-size: 13px; background: #8882; padding: 8px 12px;
+          border-radius: 8px; }
+  #reveal { margin-top: 320px; font-size: 16px; padding: 8px 16px; }
+</style>
+</head>
+<body>
+<h1>Mock click target</h1>
+<p>本頁只計算瀏覽器收到的 click 事件，不會送出任何申請、不發任何網路請求。用
+<code>calibrate --bundle &lt;瀏覽器 bundle id&gt;</code> 把游標放在黃色按鈕上校準，再用
+<code>python3 -m fans_utils rehearse --in 5 --calibration &lt;path&gt; --bundle &lt;瀏覽器 bundle id&gt;</code>
+驗證 OS 層的點擊。</p>
+
+<div id="mode"></div>
+<button id="hit" class="plain" type="button">CLICK HERE</button>
+<div id="count">0</div>
+<div>clicks accepted (忽略掉的不算)</div>
+
+<!-- Deliberately far from the button: revealing the log must not change the watched pixels. -->
+<button id="reveal" type="button">show log</button>
+<ol id="log" reversed hidden></ol>
+
+<script>
+  // Query parameters, all optional. Defaults reproduce the original always-accept behaviour.
+  //   ?ignore=N     the first N clicks are swallowed: nothing renders at all (silent miss).
+  //   ?readyAt=T    clicks before instant T are swallowed the same way. T is epoch ms or an
+  //                 ISO instant, so a rehearsal with --at can line up exactly with readiness.
+  //   ?change=0     accepted clicks are counted internally but NOTHING on the page repaints,
+  //                 so a guarded retry sees an unchanged screen and fires its full bounded
+  //                 number of attempts. The count is revealed only by the "show log" button.
+  const params = new URLSearchParams(location.search);
+  const ignoreFirst = Math.max(0, parseInt(params.get('ignore') || '0', 10) || 0);
+  const changeOnAccept = params.get('change') !== '0';
+  const readyRaw = params.get('readyAt');
+  let readyAt = null;
+  if (readyRaw !== null) {
+    const asNumber = Number(readyRaw);
+    readyAt = Number.isFinite(asNumber) ? asNumber : Date.parse(readyRaw);
+    if (!Number.isFinite(readyAt)) readyAt = null;
+  }
+
+  let accepted = 0;
+  let ignored = 0;
+  const buffered = [];   // every event, rendered only when the log is revealed
+  const hit = document.getElementById('hit');
+  const log = document.getElementById('log');
+  const countEl = document.getElementById('count');
+
+  function describeMode() {
+    const bits = [];
+    bits.push(ignoreFirst ? `ignore=${ignoreFirst} (前 ${ignoreFirst} 次點擊完全不反應)` : 'ignore=0');
+    if (readyAt !== null) bits.push(`readyAt=${new Date(readyAt).toISOString()}`);
+    bits.push(changeOnAccept ? 'change=1 (接受時按鈕變色)' : 'change=0 (整頁都不重繪，計數要按 show log 才看得到)');
+    document.getElementById('mode').textContent = bits.join('  ·  ');
+  }
+  describeMode();
+
+  // change=0 must not repaint anywhere in the observed window: drop the pressed-state flash
+  // and the live counter, both of which would otherwise differ from the baseline.
+  if (!changeOnAccept) {
+    hit.classList.remove('plain');
+    countEl.textContent = '';
+  }
+
+  function stamp(kind, e, verdict) {
+    const d = new Date();
+    const t = d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+    buffered.push(`${t}  ${kind}  ${verdict}  at (${e.screenX}, ${e.screenY}) screen / (${e.clientX}, ${e.clientY}) client`);
+    while (buffered.length > 60) buffered.shift();
+  }
+
+  function accepts() {
+    if (ignored < ignoreFirst) return false;
+    if (readyAt !== null && Date.now() < readyAt) return false;
+    return true;
+  }
+
+  hit.addEventListener('mousedown', e => stamp('mousedown', e, ''));
+  hit.addEventListener('mouseup', e => stamp('mouseup', e, ''));
+  hit.addEventListener('click', e => {
+    if (!accepts()) {
+      // Silent miss: no count, no colour, no text. The guarded retry must see an unchanged
+      // screen and try again, exactly like a button that is not live yet.
+      ignored += 1;
+      stamp('click', e, 'IGNORED');
+      return;
+    }
+    accepted += 1;
+    stamp('click', e, 'ACCEPTED');
+    if (!changeOnAccept) return;  // counted, but nothing in the window may repaint
+    // The visible change covers the button, which is inside whatever region the screen
+    // observer watches; the counter below it changes too, and that is equally intended here.
+    countEl.textContent = accepted;
+    hit.classList.remove('plain');
+    hit.classList.add('accepted');
+    hit.textContent = 'APPLIED';
+  });
+
+  document.getElementById('reveal').addEventListener('click', () => {
+    log.hidden = false;
+    countEl.textContent = accepted;  // the buffered count, shown only on demand
+    log.replaceChildren(...buffered.slice().reverse().map(line => {
+      const li = document.createElement('li');
+      li.textContent = line;
+      return li;
+    }));
+  });
+</script>
+</body>
+</html>
